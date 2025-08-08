@@ -1,3 +1,66 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Package timefall provides a high-performance, hierarchical timer wheel
+// implementation for scheduling and executing time-based events in Go.
+//
+// It is designed for scenarios that require:
+//   - High-frequency timer updates with low CPU overhead.
+//   - Large numbers of timers with varying expiration times.
+//   - Optional GC-free operation via a user-provided memory allocator.
+//
+// The timer wheel uses a multi-level bucketed structure to efficiently
+// manage timers that may be scheduled far in the future. Timers "cascade"
+// down from higher-level buckets to lower-level buckets as time advances,
+// until they reach the lowest level (the "near" wheel) where they are
+// dispatched.
+//
+// The implementation is generic and supports any event payload type via Go
+// generics.
+//
+// # Precision
+//
+// Timers operate with a fixed precision (tick duration), specified when
+// creating a new timer with New. The default precision is 10 milliseconds.
+// All timer durations are quantized to this precision.
+//
+// # Concurrency
+//
+// Timer operations are safe for concurrent use by multiple goroutines.
+// Internal locking is implemented via a lightweight spinlock.
+//
+// # Memory allocation
+//
+// By default, timer nodes are allocated from the Go heap. For GC-free
+// operation, a user-provided allocator can be injected via the package-level
+// variable `malloc`, which must implement Alloc(size) and Free(ptr) methods.
+//
+// # Example
+//
+//	import "time"
+//	type Event struct { ID int }
+//
+//	tf := timefall.New[Event](10*time.Millisecond)
+//	tf.Add(&Event{ID: 1}, 500*time.Millisecond)
+//
+//	// In a loop or ticker:
+//	tf.Update(func(e *Event) {
+//	    fmt.Println("Timer fired:", e.ID)
+//	})
 package timefall
 
 import (
@@ -9,11 +72,40 @@ import (
 	"github.com/aristanetworks/goarista/monotime"
 )
 
-func New[T any](precision ...time.Duration) (t *timer[T]) {
-	t = &timer[T]{}
+// Timer is the core hierarchical timer wheel structure.
+type Timer[T any] struct {
+	n            [timeNear]linkList[T]
+	t            [4][timeLevel]linkList[T]
+	l            int32
+	time         uint32
+	starttime    int64
+	current      int64
+	currentPoint uint64
+
+	precis time.Duration
+}
+
+// New creates and initializes a new timer wheel instance for events of type T.
+//
+// The optional precision parameter specifies the tick duration (minimum timer
+// resolution). If omitted or non-positive, the default precision is 10 milliseconds.
+// All timer durations will be rounded to the nearest multiple of this precision.
+//
+// If a package-level allocator `malloc` is set, the timer object will be allocated
+// using malloc.Alloc instead of the Go heap.
+//
+// The returned timer must be periodically advanced by calling Update, typically
+// from a ticker or game loop.
+//
+// Example:
+//
+//	tf := timefall.New[string](time.Millisecond * 5)
+//	tf.Add(new(string), time.Second)
+func New[T any](precision ...time.Duration) (t *Timer[T]) {
+	t = &Timer[T]{}
 	if malloc != nil {
 		ptr := malloc.Alloc(uint(unsafe.Sizeof(*t)))
-		t = (*timer[T])(ptr)
+		t = (*Timer[T])(ptr)
 	}
 
 	for i := range timeNear {
@@ -38,7 +130,15 @@ func New[T any](precision ...time.Duration) (t *timer[T]) {
 	return t
 }
 
-func (t *timer[T]) Destroy() {
+// Destroy stops the timer wheel, releases all pending timers, and frees
+// internal resources.
+//
+// Any remaining timers are dispatched with a nil callback (i.e., discarded).
+// If a package-level allocator is set, the timer object itself is freed
+// via malloc.Free.
+//
+// It is safe to call Destroy multiple times or on a nil timer.
+func (t *Timer[T]) Destroy() {
 	if t == nil {
 		return
 	}
@@ -65,7 +165,14 @@ func (t *timer[T]) Destroy() {
 	}
 }
 
-func (t *timer[T]) Add(event *T, duration time.Duration) {
+// Add schedules a new timer event with the specified duration until expiration.
+//
+// The event payload is copied from the provided pointer and stored internally.
+// The timer will fire after at least 'duration' has elapsed, quantized to the
+// timer's precision.
+//
+// This method is safe for concurrent use.
+func (t *Timer[T]) Add(event *T, duration time.Duration) {
 	t.acquireLock()
 	defer t.releaseLock()
 
@@ -82,7 +189,17 @@ func (t *timer[T]) Add(event *T, duration time.Duration) {
 	t.addNode(node)
 }
 
-func (t *timer[T]) Update(fn timerExecuteFunc[T]) {
+// Update advances the timer wheel to the current time and dispatches any
+// expired timers.
+//
+// The provided callback fn is invoked for each expired timer event.
+// If fn is nil, expired timers are discarded.
+//
+// Update should be called periodically, typically from a ticker running
+// at the timer's precision. Multiple calls within the same tick are ignored.
+//
+// This method is safe for concurrent use.
+func (t *Timer[T]) Update(fn TimerExecuteFunc[T]) {
 	t.assert()
 	cp := uint64(time.Unix(0, int64(monotime.Now())).UnixNano() / t.precis.Nanoseconds())
 	if cp < t.currentPoint {
@@ -96,6 +213,20 @@ func (t *timer[T]) Update(fn timerExecuteFunc[T]) {
 	for range diff {
 		t.tick(fn)
 	}
+}
+
+// Start returns the start time of the timer wheel in units of the
+// timer's precision.
+func (t *Timer[T]) Start() int64 {
+	t.assert()
+	return t.starttime
+}
+
+// Now returns the current time of the timer wheel in units of the
+// timer's precision.
+func (t *Timer[T]) Now() int64 {
+	t.assert()
+	return t.current
 }
 
 const (
@@ -131,47 +262,25 @@ func (l *linkList[T]) clear() (ret *timerNode[T]) {
 	return
 }
 
-type timer[T any] struct {
-	n            [timeNear]linkList[T]
-	t            [4][timeLevel]linkList[T]
-	l            int32
-	time         uint32
-	starttime    int64
-	current      int64
-	currentPoint uint64
-
-	precis time.Duration
-}
-
-func (t *timer[T]) assert() {
+func (t *Timer[T]) assert() {
 	if t == nil {
 		panic("timer is nil")
 	}
 }
 
-func (t *timer[T]) acquireLock() {
+func (t *Timer[T]) acquireLock() {
 	t.assert()
 	for !atomic.CompareAndSwapInt32(&t.l, 0, 1) {
 		runtime.Gosched()
 	}
 }
 
-func (t *timer[T]) releaseLock() {
+func (t *Timer[T]) releaseLock() {
 	t.assert()
 	atomic.StoreInt32(&t.l, 0)
 }
 
-func (t *timer[T]) Start() int64 {
-	t.assert()
-	return t.starttime
-}
-
-func (t *timer[T]) Now() int64 {
-	t.assert()
-	return t.current
-}
-
-func (t *timer[T]) init() {
+func (t *Timer[T]) init() {
 	t.assert()
 	now := time.Now()
 	sec := now.UnixNano() / t.precis.Nanoseconds()
@@ -182,9 +291,13 @@ func (t *timer[T]) init() {
 	atomic.StoreInt32(&t.l, 0)
 }
 
-type timerExecuteFunc[T any] func(arg *T)
+// TimerExecuteFunc is the type of callback function invoked by Update
+// for each expired timer event.
+//
+// The argument is a pointer to the event payload stored in the timer node.
+type TimerExecuteFunc[T any] func(arg *T)
 
-func (t *timer[T]) tick(fn timerExecuteFunc[T]) {
+func (t *Timer[T]) tick(fn TimerExecuteFunc[T]) {
 	t.acquireLock()
 	defer t.releaseLock()
 
@@ -197,7 +310,7 @@ func (t *timer[T]) tick(fn timerExecuteFunc[T]) {
 	t.execute(fn)
 }
 
-func (t *timer[T]) dispatchList(current *timerNode[T], fn timerExecuteFunc[T]) {
+func (t *Timer[T]) dispatchList(current *timerNode[T], fn TimerExecuteFunc[T]) {
 	for {
 		if fn != nil {
 			fn(&current.event)
@@ -213,7 +326,7 @@ func (t *timer[T]) dispatchList(current *timerNode[T], fn timerExecuteFunc[T]) {
 	}
 }
 
-func (t *timer[T]) execute(fn timerExecuteFunc[T]) {
+func (t *Timer[T]) execute(fn TimerExecuteFunc[T]) {
 	t.assert()
 	idx := t.time & timeNearMask
 
@@ -226,7 +339,7 @@ func (t *timer[T]) execute(fn timerExecuteFunc[T]) {
 	}
 }
 
-func (t *timer[T]) shift() {
+func (t *Timer[T]) shift() {
 	t.assert()
 	mask := uint32(timeNear)
 	t.time++
@@ -249,7 +362,7 @@ func (t *timer[T]) shift() {
 	}
 }
 
-func (t *timer[T]) moveList(level int, idx int) {
+func (t *Timer[T]) moveList(level int, idx int) {
 	t.assert()
 
 	current := t.t[level][idx].clear()
@@ -260,7 +373,7 @@ func (t *timer[T]) moveList(level int, idx int) {
 	}
 }
 
-func (t *timer[T]) addNode(node *timerNode[T]) {
+func (t *Timer[T]) addNode(node *timerNode[T]) {
 	t.assert()
 
 	time := node.expire
