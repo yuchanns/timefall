@@ -147,33 +147,6 @@ func TestTimerVariousPrecisions(t *testing.T) {
 	}
 }
 
-func BenchmarkTimerMassive(b *testing.B) {
-	type testData struct {
-		start    time.Time
-		expected time.Duration
-	}
-
-	const precision = 10 * time.Millisecond
-	const nodeCount = 1_000_00
-
-	tf := timefall.New[testData](precision)
-
-	for range nodeCount {
-		tf.Add(&testData{
-			start:    time.Now(),
-			expected: precision,
-		}, precision)
-	}
-
-	ticker := time.NewTicker(precision)
-	defer ticker.Stop()
-
-	for b.Loop() {
-		<-ticker.C
-		tf.Update(func(arg *testData) {})
-	}
-}
-
 func TestTimerDestroy(t *testing.T) {
 	t.Parallel()
 	tf := timefall.New[int]()
