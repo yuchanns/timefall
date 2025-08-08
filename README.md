@@ -15,6 +15,35 @@ Instead, the user is responsible for periodically advancing the timer wheel by c
 
 When `Update` is called, all expired timers for the current tick are dispatched to the provided callback.
 
+
+<details>
+<summary>Benchmark</summary>
+
+```bash
+❯ go test -bench=. -benchmem -count=6 -run=$$ -v
+goos: linux
+goarch: amd64
+pkg: go.yuchanns.xyz/timefall
+cpu: Intel(R) Core(TM) i5-10500 CPU @ 3.10GHz
+BenchmarkTimerMassive
+BenchmarkTimerMassive-12            1977            509834 ns/op               0 B/op          0 allocs/op
+BenchmarkTimerMassive-12            2451            550316 ns/op               0 B/op          0 allocs/op
+BenchmarkTimerMassive-12            2028            585764 ns/op               0 B/op          0 allocs/op
+BenchmarkTimerMassive-12            2188            567332 ns/op               0 B/op          0 allocs/op
+BenchmarkTimerMassive-12            2107            509195 ns/op               0 B/op          0 allocs/op
+BenchmarkTimerMassive-12            2427            548307 ns/op               0 B/op          0 allocs/op
+BenchmarkStdTimerMassive
+BenchmarkStdTimerMassive-12           72          21694044 ns/op               0 B/op          0 allocs/op
+BenchmarkStdTimerMassive-12           76          18379989 ns/op               0 B/op          0 allocs/op
+BenchmarkStdTimerMassive-12           74          24394464 ns/op               0 B/op          0 allocs/op
+BenchmarkStdTimerMassive-12           74          22217037 ns/op               0 B/op          0 allocs/op
+BenchmarkStdTimerMassive-12           70          22525907 ns/op               0 B/op          0 allocs/op
+BenchmarkStdTimerMassive-12           78          23944621 ns/op               0 B/op          0 allocs/op
+PASS
+ok      go.yuchanns.xyz/timefall        307.905s
+```
+</details>
+
 ## Features
 
 - **Hierarchical timer wheel** with 1 near wheel and 4 higher-level wheels.
