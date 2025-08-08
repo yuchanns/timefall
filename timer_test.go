@@ -72,3 +72,195 @@ func TestTimerDefault(t *testing.T) {
 	wg.Wait()
 	cancel()
 }
+
+func TestTimerVariousPrecisions(t *testing.T) {
+	t.Parallel()
+	assert := require.New(t)
+
+	type testData struct {
+		start    time.Time
+		expected time.Duration
+	}
+
+	precisions := []time.Duration{
+		time.Millisecond,
+		5 * time.Millisecond,
+		20 * time.Millisecond,
+		50 * time.Millisecond,
+	}
+
+	for _, prec := range precisions {
+		t.Run(prec.String(), func(t *testing.T) {
+			t.Parallel()
+			tf := timefall.New[testData](prec)
+
+			wg := sync.WaitGroup{}
+			expected := 200 * time.Millisecond
+			wg.Add(1)
+			tf.Add(&testData{
+				start:    time.Now(),
+				expected: expected,
+			}, expected)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				ticker := time.NewTicker(prec)
+				for {
+					select {
+					case <-ctx.Done():
+						ticker.Stop()
+						return
+					case <-ticker.C:
+						tf.Update(func(arg *testData) {
+							defer wg.Done()
+							diff := time.Since(arg.start)
+							assert.InDelta(
+								diff.Nanoseconds(),
+								arg.expected.Nanoseconds(),
+								float64(prec.Nanoseconds()),
+							)
+						})
+					}
+				}
+			}()
+
+			wg.Wait()
+			cancel()
+		})
+	}
+}
+
+func BenchmarkTimerMassive(b *testing.B) {
+	type testData struct {
+		start    time.Time
+		expected time.Duration
+	}
+
+	const precision = 10 * time.Millisecond
+	const nodeCount = 1_000_00
+
+	tf := timefall.New[testData](precision)
+
+	for range nodeCount {
+		tf.Add(&testData{
+			start:    time.Now(),
+			expected: precision,
+		}, precision)
+	}
+
+	ticker := time.NewTicker(precision)
+	defer ticker.Stop()
+
+	for b.Loop() {
+		<-ticker.C
+		tf.Update(func(arg *testData) {})
+	}
+}
+
+func TestTimerDestroy(t *testing.T) {
+	t.Parallel()
+	tf := timefall.New[int]()
+	tf.Add(new(int), 100*time.Millisecond)
+	require.NotPanics(t, func() {
+		tf.Destroy()
+	})
+}
+
+func TestTimerConcurrentAddUpdate(t *testing.T) {
+	t.Parallel()
+	assert := require.New(t)
+
+	type testData struct {
+		start    time.Time
+		expected time.Duration
+	}
+
+	const precision = 5 * time.Millisecond
+	tf := timefall.New[testData](precision)
+
+	wg := sync.WaitGroup{}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				wg.Add(1)
+				tf.Add(&testData{
+					start:    time.Now(),
+					expected: 50 * time.Millisecond,
+				}, 50*time.Millisecond)
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(precision)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				tf.Update(func(arg *testData) {
+					diff := time.Since(arg.start)
+					assert.LessOrEqual(diff.Milliseconds(), int64(arg.expected.Milliseconds()+precision.Milliseconds()))
+					wg.Done()
+				})
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+func TestTimerLongDelay(t *testing.T) {
+	t.Parallel()
+	assert := require.New(t)
+
+	type testData struct {
+		start    time.Time
+		expected time.Duration
+	}
+
+	const precision = 10 * time.Millisecond
+	tf := timefall.New[testData](precision)
+
+	expected := 5 * time.Second
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	tf.Add(&testData{
+		start:    time.Now(),
+		expected: expected,
+	}, expected)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(precision)
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				tf.Update(func(arg *testData) {
+					defer wg.Done()
+					diff := time.Since(arg.start)
+					assert.InDelta(
+						diff.Nanoseconds(),
+						arg.expected.Nanoseconds(),
+						float64(precision.Nanoseconds()),
+					)
+				})
+			}
+		}
+	}()
+
+	wg.Wait()
+	cancel()
+}

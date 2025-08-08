@@ -1,3 +1,3 @@
 ## timefall
 
-timefall is an efficient timer wheel for Go, optional GC-free included.
+timefall — An efficient hierarchical timer wheel for Go.
